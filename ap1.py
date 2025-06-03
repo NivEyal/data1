@@ -115,13 +115,6 @@ def extract_transactions_from_pdf_hapoalim(pdf_content_bytes, filename_for_loggi
                             balance_str = balance_match.group(1)
                             balance = clean_number_general(balance_str)
 
-                            # FIX: Removed the overly strict `char_before` check that might cause valid lines to be skipped.
-                            # if balance_start_index > 0:
-                            #     char_before = original_line[balance_start_index - 1]
-                            #     if char_before not in (' ', '₪', '-', '+'):
-                            #         logging.debug(f"Hapoalim: Skipping line {line_num+1} due to unexpected char before balance: '{original_line[:balance_start_index].strip()}' -> '{original_line}'")
-                            #         continue
-
                             if balance is not None:
                                 lower_line = line_normalized.lower()
                                 if "יתרה לסוף יום" in lower_line or "עובר ושב" in lower_line or "תנועות בחשבון" in lower_line or "עמוד" in lower_line or "סך הכל" in lower_line or "הודעה זו כוללת" in lower_line:
@@ -133,8 +126,6 @@ def extract_transactions_from_pdf_hapoalim(pdf_content_bytes, filename_for_loggi
                                     'Balance': balance,
                                 })
                                 logging.debug(f"Hapoalim: Found transaction - Date: {parsed_date}, Balance: {balance}, Line: {original_line.strip()}")
-                        # else: logging.debug(f"Hapoalim: Found date but no balance pattern match in line: {original_line.strip()}")
-                    # else: logging.debug(f"Hapoalim: Found date pattern but failed to parse date string: {date_str} in line: {original_line.strip()}")
         except Exception as e:
             logging.error(f"Hapoalim: Error processing line {line_num+1} on page {page_num+1}: {e}", exc_info=True)
             continue
@@ -150,7 +141,6 @@ def extract_transactions_from_pdf_hapoalim(pdf_content_bytes, filename_for_loggi
     df['Balance'] = pd.to_numeric(df['Balance'], errors='coerce') # Ensure numeric, handle errors
     df = df.dropna(subset=['Date', 'Balance']) # Remove rows where date or balance parsing failed
 
-    # FIX: Ensure final sort and unique date handling is robust
     df = df.sort_values(by='Date').groupby('Date')['Balance'].last().reset_index()
     df = df.sort_values(by='Date').reset_index(drop=True) # Final sort
 
@@ -202,7 +192,7 @@ def normalize_text_leumi(text):
     if text is None or pd.isna(text): return None
     text = str(text).replace('\r', ' ').replace('\n', ' ').replace('\u200b', '').strip()
     text = unicodedata.normalize('NFC', text)
-    # FIX: This Hebrew reversal logic is for specific PDF extraction cases. Keep as is.
+    # This Hebrew reversal logic is for specific PDF extraction cases. Keep as is.
     if any('\u0590' <= char <= '\u05EA' for char in text):
        words = text.split()
        reversed_text = ' '.join(words[::-1])
@@ -216,10 +206,11 @@ def parse_leumi_transaction_line_extracted_order_v2(line_text, previous_balance)
     pattern = re.compile(
         r"^([\-\u200b\d,\.]+)\s+" # 1: Balance
         r"(\d{1,3}(?:,\d{3})*\.\d{2})?\s*" # 2: Optional Amount
-        r"(\S+)\s+"             # 3: Reference (FIX: changed to non-optional `(\S+)` from `(\S+)?` as in working version)
+        r"(\S+)\s+"             # 3: Reference (non-optional as in working version)
         r"(.*?)\s+"              # 4: Description
-        r"(\d{1,2}/\d{1,2}/\d{2,4})\s+" # 5: Value Date
-        r"(\d{1,2}/\d{1,2}/\d{2,4})$"   # 6: Transaction Date
+        # FIX: The order of date groups was the issue. Reverting to match working version's logic.
+        r"(\d{1,2}/\d{1,2}/\d{2,4})\s+" # 5: This should be TRANSACTION Date (for trends)
+        r"(\d{1,2}/\d{1,2}/\d{2,4})$"   # 6: This should be VALUE Date
     )
 
     match = pattern.match(line)
@@ -227,12 +218,14 @@ def parse_leumi_transaction_line_extracted_order_v2(line_text, previous_balance)
 
     balance_str = match.group(1)
     amount_str = match.group(2)
-    reference_str = match.group(3) # Capture the reference
+    reference_str = match.group(3)
     description_raw = match.group(4)
-    value_date_str = match.group(5)
-    transaction_date_str = match.group(6) # Not used for balance points in this case
+    transaction_date_str = match.group(5) # Use this for the date field
+    value_date_str = match.group(6) # Keep for debugging/completeness, but not used for main date field
 
-    parsed_date = parse_date_leumi(value_date_str) # Use value date for balance
+    # FIX: Use transaction_date_str (group 5) for parsing the date for the trend.
+    parsed_date = parse_date_leumi(transaction_date_str)
+
     if not parsed_date: return None
 
     current_balance = clean_number_leumi(balance_str)
@@ -246,10 +239,8 @@ def parse_leumi_transaction_line_extracted_order_v2(line_text, previous_balance)
         tolerance = 0.01
         if abs(balance_diff + amount) <= tolerance: debit = amount
         elif abs(balance_diff - amount) <= tolerance: credit = amount
-        # else: logging.debug(f"Leumi: Balance change ({balance_diff}) does not match amount ({amount}) for line: {line}")
     elif amount is None: # If no explicit amount, it might just be a balance line, not a transaction.
-         # For balance trend, we still want the balance
-         pass
+         pass # For balance trend, we still want the balance even if no specific transaction amount.
 
     return {'Date': parsed_date, 'Balance': current_balance, 'Debit': debit, 'Credit': credit, 'Reference': reference_str, 'Description': normalize_text_leumi(description_raw)}
 
@@ -260,7 +251,6 @@ def extract_leumi_transactions_line_by_line(pdf_content_bytes, filename_for_logg
     try:
         with pdfplumber.open(io.BytesIO(pdf_content_bytes)) as pdf:
             previous_balance = None
-            found_first_balance = False
             logging.info(f"Starting Leumi PDF parsing for {filename_for_logging}")
 
             for page_num, page in enumerate(pdf.pages):
@@ -273,15 +263,15 @@ def extract_leumi_transactions_line_by_line(pdf_content_bytes, filename_for_logg
                         normalized_line = normalize_text_leumi(line_text.strip())
                         if not normalized_line or len(normalized_line) < 10: continue
 
-                        # Initial balance detection (important for `previous_balance` to seed `parse_leumi_transaction_line_extracted_order_v2`)
-                        if not found_first_balance:
+                        # Try to find initial balance. This usually appears at the top of the statement.
+                        if previous_balance is None:
                             initial_balance_match = re.search(r"(?:יתרה\s+קודמת|יתרת\s+סגירה\s+קודמת|יתרה\s+נכון\s+לתאריך)\s+([\-\u200b\d,\.]+)", normalized_line)
                             if initial_balance_match:
                                 bal_str = initial_balance_match.group(1)
                                 initial_bal = clean_number_leumi(bal_str)
                                 if initial_bal is not None:
                                     previous_balance = initial_bal
-                                    found_first_balance = True
+                                    # Don't add this "previous balance" line to transactions_data, it's just a starting point
                                     logging.debug(f"Leumi: Found initial balance on page {page_num+1}: {initial_bal} from line: {normalized_line.strip()}")
                                     continue # Skip this line from further parsing for transactions
 
@@ -291,13 +281,11 @@ def extract_leumi_transactions_line_by_line(pdf_content_bytes, filename_for_logg
                             current_balance = parsed_data['Balance']
                             parsed_date = parsed_data['Date']
 
-                            # FIX: Removed the conditional append logic. Append all valid balance points,
-                            # and let the final groupby handle taking the last balance for each date.
+                            # Append any valid balance and date, and let the final groupby resolve
                             transactions_data.append({'Date': parsed_date, 'Balance': current_balance})
                             logging.debug(f"Leumi: Appended balance - Date: {parsed_date}, Balance: {current_balance}, Line: {normalized_line.strip()}")
 
-                            # Always update previous_balance for the next line's calculation
-                            # This is crucial for the debit/credit calculation in parse_leumi_transaction_line_extracted_order_v2
+                            # Always update previous_balance if a valid balance was parsed from the line
                             previous_balance = current_balance
                         else:
                             # If a line doesn't match the transaction pattern or has invalid data,
@@ -321,7 +309,6 @@ def extract_leumi_transactions_line_by_line(pdf_content_bytes, filename_for_logg
     df['Balance'] = pd.to_numeric(df['Balance'], errors='coerce') # Ensure numeric
     df = df.dropna(subset=['Date', 'Balance']) # Remove rows where date or balance parsing failed
 
-    # FIX: The `groupby('Date')['Balance'].last().reset_index()` is correct for daily last balances.
     df = df.sort_values(by='Date').groupby('Date')['Balance'].last().reset_index()
     df = df.sort_values(by='Date').reset_index(drop=True) # Final sort
 
@@ -334,14 +321,13 @@ def parse_discont_transaction_line(line_text):
     line = line_text.strip()
     if not line or len(line) < 20: return None
 
-    # FIX: Use the stricter pattern from the "working" version for balance and amount at the start
+    # Use the stricter pattern from the "working" version for balance and amount at the start
     balance_amount_pattern = re.compile(r"^([₪\-,\d]+\.\d{2})\s+([₪\-,\d]+\.\d{2})")
     balance_amount_match = balance_amount_pattern.search(line) # Search across the whole line
 
     if not balance_amount_match: return None
 
     balance_str = balance_amount_match.group(1)
-    # amount_str = balance_amount_match.group(2) # Not directly used for balance trend
     balance = clean_number_general(balance_str)
 
     if balance is None:
@@ -349,7 +335,6 @@ def parse_discont_transaction_line(line_text):
         return None
 
     # Date pattern usually appears later in the line, after the balance/amount.
-    # From the "working" version, it's `date_pattern = re.compile(r"(\d{1,2}/\d{1,2}/\d{2,4})\s+(\d{1,2}/\d{1,2}/\d{2,4})$")`
     # This implies dates are at the very end. Let's use this in the *full* line.
     date_pattern = re.compile(r"(\d{1,2}/\d{1,2}/\d{2,4})\s+(\d{1,2}/\d{1,2}/\d{2,4})$")
     date_match = date_pattern.search(line)
@@ -364,7 +349,7 @@ def parse_discont_transaction_line(line_text):
         return None
 
     lower_line = normalize_text_general(line).lower() # Normalize the whole line before checking
-    if any(phrase in lower_line for phrase in ["יתרת סגירה", "יתרה נכון", "סך הכל", "סהכ", "עמוד", "הודעה זו כוללת"]): # Added "הודעה זו כוללת"
+    if any(phrase in lower_line for phrase in ["יתרת סגירה", "יתרה נכון", "סך הכל", "סהכ", "עמוד", "הודעה זו כוללת"]):
          logging.debug(f"Discount: Skipping likely closing balance/summary/footer line: {line.strip()}")
          return None
     if any(header_part in lower_line for header_part in ["תאריך רישום", "תאריך ערך", "תיאור", "אסמכתא", "סכום", "יתרה"]):
@@ -390,11 +375,7 @@ def extract_and_parse_discont_pdf(pdf_content_bytes, filename_for_logging="disco
                             normalized_line = normalize_text_general(line_text)
                             parsed = parse_discont_transaction_line(normalized_line)
                             if parsed:
-                                # FIX: Removed the conditional append logic. Append all valid balance points,
-                                # and let the final groupby handle taking the last balance for each date.
                                 transactions.append(parsed)
-                            # else: logging.debug(f"Discount: Line did not match transaction pattern: {normalized_line.strip()}")
-
                 except Exception as e:
                     logging.error(f"Discount: Error processing page {page_num+1}: {e}", exc_info=True)
                     continue
@@ -412,7 +393,6 @@ def extract_and_parse_discont_pdf(pdf_content_bytes, filename_for_logging="disco
     df['Balance'] = pd.to_numeric(df['Balance'], errors='coerce') # Ensure numeric
     df = df.dropna(subset=['Date', 'Balance']) # Remove rows with parsing errors
 
-    # FIX: The `groupby('Date')['Balance'].last().reset_index()` is correct for daily last balances.
     df = df.sort_values(by='Date').groupby('Date')['Balance'].last().reset_index()
     df = df.sort_values(by='Date').reset_index(drop=True) # Final sort
 
@@ -457,7 +437,7 @@ def process_entry_final_cr(entry_data, section, all_rows_list):
 
     numbers_raw = entry_data['numbers']
     # Clean and filter out None values
-    numbers = [clean_credit_number(n) for n in numbers_raw if clean_credit_number(n) is not None]
+    numbers = [clean_credit_number(n) for n n in numbers_raw if clean_credit_number(n) is not None]
 
     num_count = len(numbers)
     limit_col, original_col, outstanding_col, unpaid_col = np.nan, np.nan, np.nan, np.nan
@@ -535,7 +515,7 @@ def extract_credit_data_final_v13(pdf_content_bytes, filename_for_logging="credi
                 "מסגרת אשראי מתחדשת": "מסגרת אשראי",
                 "אחר": "אחר" # Catch-all
             }
-            # FIX: Use the stricter number line pattern from the "working" version
+            # Use the stricter number line pattern from the "working" version
             number_line_pattern = re.compile(r"^\s*(-?\d{1,3}(?:,\d{3})*\.?\d*)\s*$")
             id_line_pattern = re.compile(r"^XX-[\w\d\-]+.*$")
 
@@ -573,7 +553,7 @@ def extract_credit_data_final_v13(pdf_content_bytes, filename_for_logging="credi
                             logging.debug(f"CR: Detected summary/footer line: {line}")
                             continue
 
-                        # FIX: Reordered and simplified line classification logic
+                        # Reordered and simplified line classification logic
                         number_match = number_line_pattern.match(line)
                         is_id_line = id_line_pattern.match(line)
                         is_noise_line = any(word in line.split() for word in COLUMN_HEADER_WORDS_CR) or line in [':', '.', '-', '—'] or (len(line.replace(' ','')) < 3 and not line.replace(' ','').isdigit()) or re.match(r"^\d{1,2}/\d{1,2}/\d{2,4}$", line)
@@ -618,7 +598,7 @@ def extract_credit_data_final_v13(pdf_content_bytes, filename_for_logging="credi
 
                         # If it's not a number, ID, or noise, it's potentially a bank name or description
                         else:
-                            # FIX: Simplified conditions for bank name/continuation logic
+                            # Simplified conditions for bank name/continuation logic
                             cleaned_line = re.sub(r'\s*XX-[\w\d\-]+.*|\s+\d+$', '', line).strip()
                             common_continuations = ["לישראל", "בע\"מ", "ומשכנתאות", "נדל\"ן", "דיסקונט", "הראשון", "פיננסים", "איגוד", "אשראי", "חברה", "למימון", "שירותים"]
                             
