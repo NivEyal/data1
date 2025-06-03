@@ -89,8 +89,9 @@ def extract_transactions_from_pdf_hapoalim(pdf_content_bytes, filename_for_loggi
         logging.error(f"Hapoalim: Failed to open/process PDF {filename_for_logging}: {e}", exc_info=True)
         return pd.DataFrame()
 
-    date_pattern_end = re.compile(r"\s*(\d{1,2}/\d{1,2}/\d{4})\s*$")
-    balance_pattern_start = re.compile(r"^\s*[₪]?[+\-]?\s*([\d,]+\.\d{2})")
+    date_pattern_end = re.compile(r"(\d{1,2}/\d{1,2}/\d{4})\s*$")
+    # FIX: Use the more robust pattern from the "working" version
+    balance_pattern_start = re.compile(r"^\s*(₪?-?[\d,]+\.\d{2})")
 
     logging.info(f"Starting Hapoalim PDF parsing for {filename_for_logging}")
 
@@ -114,12 +115,12 @@ def extract_transactions_from_pdf_hapoalim(pdf_content_bytes, filename_for_loggi
                             balance_str = balance_match.group(1)
                             balance = clean_number_general(balance_str)
 
-                            balance_start_index = balance_match.start()
-                            if balance_start_index > 0:
-                                char_before = original_line[balance_start_index - 1]
-                                if char_before not in (' ', '₪', '-', '+'):
-                                    logging.debug(f"Hapoalim: Skipping line {line_num+1} due to unexpected char before balance: '{original_line[:balance_start_index].strip()}' -> '{original_line}'")
-                                    continue
+                            # FIX: Removed the overly strict `char_before` check that might cause valid lines to be skipped.
+                            # if balance_start_index > 0:
+                            #     char_before = original_line[balance_start_index - 1]
+                            #     if char_before not in (' ', '₪', '-', '+'):
+                            #         logging.debug(f"Hapoalim: Skipping line {line_num+1} due to unexpected char before balance: '{original_line[:balance_start_index].strip()}' -> '{original_line}'")
+                            #         continue
 
                             if balance is not None:
                                 lower_line = line_normalized.lower()
@@ -132,7 +133,6 @@ def extract_transactions_from_pdf_hapoalim(pdf_content_bytes, filename_for_loggi
                                     'Balance': balance,
                                 })
                                 logging.debug(f"Hapoalim: Found transaction - Date: {parsed_date}, Balance: {balance}, Line: {original_line.strip()}")
-                            # else: logging.debug(f"Hapoalim: Found date but failed to clean balance: {balance_str} in line: {original_line.strip()}")
                         # else: logging.debug(f"Hapoalim: Found date but no balance pattern match in line: {original_line.strip()}")
                     # else: logging.debug(f"Hapoalim: Found date pattern but failed to parse date string: {date_str} in line: {original_line.strip()}")
         except Exception as e:
@@ -150,6 +150,7 @@ def extract_transactions_from_pdf_hapoalim(pdf_content_bytes, filename_for_loggi
     df['Balance'] = pd.to_numeric(df['Balance'], errors='coerce') # Ensure numeric, handle errors
     df = df.dropna(subset=['Date', 'Balance']) # Remove rows where date or balance parsing failed
 
+    # FIX: Ensure final sort and unique date handling is robust
     df = df.sort_values(by='Date').groupby('Date')['Balance'].last().reset_index()
     df = df.sort_values(by='Date').reset_index(drop=True) # Final sort
 
@@ -157,12 +158,16 @@ def extract_transactions_from_pdf_hapoalim(pdf_content_bytes, filename_for_loggi
     return df[['Date', 'Balance']]
 
 
-# --- LEUMI PARSER (Assume correct from previous version) ---
+# --- LEUMI PARSER ---
 def clean_transaction_amount_leumi(text):
     """Cleans Leumi transaction amount, handles potential unicode zero-width space."""
     if text is None or pd.isna(text) or text == '': return None
     text = str(text).strip().replace('₪', '').replace(',', '')
     text = text.lstrip('\u200b')
+    # FIX: Add multi-decimal handling from working version
+    if text.count('.') > 1:
+        parts = text.split('.')
+        text = parts[0] + '.' + "".join(parts[1:])
     if '.' not in text: return None # Requires a decimal point
     try:
         val = float(text)
@@ -176,7 +181,16 @@ def clean_transaction_amount_leumi(text):
 
 def clean_number_leumi(text):
      """Specific cleaner for Leumi numbers (balances often). Uses general cleaner."""
-     return clean_number_general(text)
+     if text is None or pd.isna(text) or text == '': return None
+     text = str(text).strip().replace('₪', '').replace(',', '')
+     text = text.lstrip('\u200b')
+     # FIX: Add multi-decimal handling from working version
+     if text.count('.') > 1:
+        parts = text.split('.')
+        text = parts[0] + '.' + "".join(parts[1:])
+     try:
+        return float(text)
+     except ValueError: return None
 
 
 def parse_date_leumi(date_str):
@@ -188,6 +202,7 @@ def normalize_text_leumi(text):
     if text is None or pd.isna(text): return None
     text = str(text).replace('\r', ' ').replace('\n', ' ').replace('\u200b', '').strip()
     text = unicodedata.normalize('NFC', text)
+    # FIX: This Hebrew reversal logic is for specific PDF extraction cases. Keep as is.
     if any('\u0590' <= char <= '\u05EA' for char in text):
        words = text.split()
        reversed_text = ' '.join(words[::-1])
@@ -201,7 +216,7 @@ def parse_leumi_transaction_line_extracted_order_v2(line_text, previous_balance)
     pattern = re.compile(
         r"^([\-\u200b\d,\.]+)\s+" # 1: Balance
         r"(\d{1,3}(?:,\d{3})*\.\d{2})?\s*" # 2: Optional Amount
-        r"(\S+)?\s*"             # 3: Optional single non-space char/code
+        r"(\S+)\s+"             # 3: Reference (FIX: changed to non-optional `(\S+)` from `(\S+)?` as in working version)
         r"(.*?)\s+"              # 4: Description
         r"(\d{1,2}/\d{1,2}/\d{2,4})\s+" # 5: Value Date
         r"(\d{1,2}/\d{1,2}/\d{2,4})$"   # 6: Transaction Date
@@ -212,10 +227,12 @@ def parse_leumi_transaction_line_extracted_order_v2(line_text, previous_balance)
 
     balance_str = match.group(1)
     amount_str = match.group(2)
+    reference_str = match.group(3) # Capture the reference
+    description_raw = match.group(4)
     value_date_str = match.group(5)
-    # transaction_date_str = match.group(6) # Not used for balance points
+    transaction_date_str = match.group(6) # Not used for balance points in this case
 
-    parsed_date = parse_date_leumi(value_date_str)
+    parsed_date = parse_date_leumi(value_date_str) # Use value date for balance
     if not parsed_date: return None
 
     current_balance = clean_number_leumi(balance_str)
@@ -230,8 +247,11 @@ def parse_leumi_transaction_line_extracted_order_v2(line_text, previous_balance)
         if abs(balance_diff + amount) <= tolerance: debit = amount
         elif abs(balance_diff - amount) <= tolerance: credit = amount
         # else: logging.debug(f"Leumi: Balance change ({balance_diff}) does not match amount ({amount}) for line: {line}")
+    elif amount is None: # If no explicit amount, it might just be a balance line, not a transaction.
+         # For balance trend, we still want the balance
+         pass
 
-    return {'Date': parsed_date, 'Balance': current_balance, 'Debit': debit, 'Credit': credit}
+    return {'Date': parsed_date, 'Balance': current_balance, 'Debit': debit, 'Credit': credit, 'Reference': reference_str, 'Description': normalize_text_leumi(description_raw)}
 
 
 def extract_leumi_transactions_line_by_line(pdf_content_bytes, filename_for_logging="leumi_pdf"):
@@ -253,6 +273,7 @@ def extract_leumi_transactions_line_by_line(pdf_content_bytes, filename_for_logg
                         normalized_line = normalize_text_leumi(line_text.strip())
                         if not normalized_line or len(normalized_line) < 10: continue
 
+                        # Initial balance detection (important for `previous_balance` to seed `parse_leumi_transaction_line_extracted_order_v2`)
                         if not found_first_balance:
                             initial_balance_match = re.search(r"(?:יתרה\s+קודמת|יתרת\s+סגירה\s+קודמת|יתרה\s+נכון\s+לתאריך)\s+([\-\u200b\d,\.]+)", normalized_line)
                             if initial_balance_match:
@@ -262,37 +283,26 @@ def extract_leumi_transactions_line_by_line(pdf_content_bytes, filename_for_logg
                                     previous_balance = initial_bal
                                     found_first_balance = True
                                     logging.debug(f"Leumi: Found initial balance on page {page_num+1}: {initial_bal} from line: {normalized_line.strip()}")
-                                    continue
-
-                            if previous_balance is None:
-                                initial_entry = parse_leumi_transaction_line_extracted_order_v2(normalized_line, None)
-                                if initial_entry and initial_entry['Balance'] is not None:
-                                     previous_balance = initial_entry['Balance']
-                                     found_first_balance = True
-                                     logging.debug(f"Leumi: Treating first parsed entry balance as initial balance: {previous_balance} from line: {normalized_line.strip()}")
-                                     # Don't continue here, let it potentially be added below
+                                    continue # Skip this line from further parsing for transactions
 
                         parsed_data = parse_leumi_transaction_line_extracted_order_v2(normalized_line, previous_balance)
 
-                        if parsed_data:
+                        if parsed_data and parsed_data['Balance'] is not None and parsed_data['Date'] is not None:
                             current_balance = parsed_data['Balance']
                             parsed_date = parsed_data['Date']
 
-                            if parsed_data['Debit'] is not None or parsed_data['Credit'] is not None or previous_balance is None:
-                                if previous_balance is None: # This is the first valid balance line found
-                                    previous_balance = current_balance
+                            # FIX: Removed the conditional append logic. Append all valid balance points,
+                            # and let the final groupby handle taking the last balance for each date.
+                            transactions_data.append({'Date': parsed_date, 'Balance': current_balance})
+                            logging.debug(f"Leumi: Appended balance - Date: {parsed_date}, Balance: {current_balance}, Line: {normalized_line.strip()}")
 
-                                # Append only if different from the last entry or if it's the first entry
-                                if not transactions_data or (transactions_data[-1]['Date'] != parsed_date or transactions_data[-1]['Balance'] != current_balance):
-                                     transactions_data.append({'Date': parsed_date, 'Balance': current_balance})
-                                     logging.debug(f"Leumi: Appended transaction balance - Date: {parsed_date}, Balance: {current_balance}, Line: {normalized_line.strip()}")
-
-                                previous_balance = current_balance # Update previous balance for the next line
-                            else:
-                                # Line matched format but no transaction amount, update previous_balance if valid
-                                if current_balance is not None:
-                                     previous_balance = current_balance
-                                logging.debug(f"Leumi: Matched line format but no transaction amount detected, only updating previous balance if valid: {normalized_line.strip()}")
+                            # Always update previous_balance for the next line's calculation
+                            # This is crucial for the debit/credit calculation in parse_leumi_transaction_line_extracted_order_v2
+                            previous_balance = current_balance
+                        else:
+                            # If a line doesn't match the transaction pattern or has invalid data,
+                            # previous_balance remains from last valid line.
+                            pass
 
                 except Exception as e:
                      logging.error(f"Leumi: Error processing line {line_num+1} on page {page_num+1}: {e}", exc_info=True)
@@ -311,52 +321,50 @@ def extract_leumi_transactions_line_by_line(pdf_content_bytes, filename_for_logg
     df['Balance'] = pd.to_numeric(df['Balance'], errors='coerce') # Ensure numeric
     df = df.dropna(subset=['Date', 'Balance']) # Remove rows where date or balance parsing failed
 
+    # FIX: The `groupby('Date')['Balance'].last().reset_index()` is correct for daily last balances.
     df = df.sort_values(by='Date').groupby('Date')['Balance'].last().reset_index()
     df = df.sort_values(by='Date').reset_index(drop=True) # Final sort
 
     logging.info(f"Leumi: Successfully extracted {len(df)} unique balance points from {filename_for_logging}")
     return df[['Date', 'Balance']]
 
-# --- DISCOUNT PARSER (Assume correct from previous version) ---
+# --- DISCOUNT PARSER ---
 def parse_discont_transaction_line(line_text):
     """Attempts to parse a line from Discount assuming specific date/balance placement."""
     line = line_text.strip()
     if not line or len(line) < 20: return None
 
-    date_pattern = re.compile(r"(\d{1,2}/\d{1,2}/\d{2,4})\s+(\d{1,2}/\d{1,2}/\d{2,4})$")
-    date_match = date_pattern.search(line)
-    if not date_match: return None
+    # FIX: Use the stricter pattern from the "working" version for balance and amount at the start
+    balance_amount_pattern = re.compile(r"^([₪\-,\d]+\.\d{2})\s+([₪\-,\d]+\.\d{2})")
+    balance_amount_match = balance_amount_pattern.search(line) # Search across the whole line
 
-    line_before_dates = line[:date_match.start()].strip()
-    if not line_before_dates: return None
+    if not balance_amount_match: return None
 
-    balance_pattern_start = re.compile(r"^[₪]?\s*([+\-]?[\d,]+\.\d{2})(?:\s+[₪]?\s*[+\-]?[\d,]+\.\d{2})?") # Primary pattern
-    balance_match = balance_pattern_start.search(line_before_dates)
-
-    if not balance_match:
-         # Fallback for more flexible search
-         balance_pattern_flexible = re.compile(r"^(?:.*?)\s*[₪]?\s*([+\-]?[\d,]+\.\d{2})(?:\s+[₪]?\s*[+\-]?[\d,]+\.\d{2})?")
-         balance_match = balance_pattern_flexible.search(line_before_dates)
-         if not balance_match:
-            # logging.debug(f"Discount: Found dates but no clear balance pattern at start of '{line_before_dates}' from line: {line.strip()}")
-            return None
-
-    balance_str = balance_match.group(1)
+    balance_str = balance_amount_match.group(1)
+    # amount_str = balance_amount_match.group(2) # Not directly used for balance trend
     balance = clean_number_general(balance_str)
 
     if balance is None:
         logging.debug(f"Discount: Found dates but failed to clean balance: {balance_str} in line: {line.strip()}")
         return None
 
-    date_str = date_match.group(1) # Use the first date found
+    # Date pattern usually appears later in the line, after the balance/amount.
+    # From the "working" version, it's `date_pattern = re.compile(r"(\d{1,2}/\d{1,2}/\d{2,4})\s+(\d{1,2}/\d{1,2}/\d{2,4})$")`
+    # This implies dates are at the very end. Let's use this in the *full* line.
+    date_pattern = re.compile(r"(\d{1,2}/\d{1,2}/\d{2,4})\s+(\d{1,2}/\d{1,2}/\d{2,4})$")
+    date_match = date_pattern.search(line)
+    if not date_match: return None
+
+    # Use the first date (transaction date typically)
+    date_str = date_match.group(1)
     parsed_date = parse_date_general(date_str)
 
     if not parsed_date:
         logging.debug(f"Discount: Failed to parse date '{date_str}' from line: {line.strip()}")
         return None
 
-    lower_line = line.lower()
-    if any(phrase in lower_line for phrase in ["יתרת סגירה", "יתרה נכון", "סך הכל", "סהכ", "עמוד"]):
+    lower_line = normalize_text_general(line).lower() # Normalize the whole line before checking
+    if any(phrase in lower_line for phrase in ["יתרת סגירה", "יתרה נכון", "סך הכל", "סהכ", "עמוד", "הודעה זו כוללת"]): # Added "הודעה זו כוללת"
          logging.debug(f"Discount: Skipping likely closing balance/summary/footer line: {line.strip()}")
          return None
     if any(header_part in lower_line for header_part in ["תאריך רישום", "תאריך ערך", "תיאור", "אסמכתא", "סכום", "יתרה"]):
@@ -382,10 +390,9 @@ def extract_and_parse_discont_pdf(pdf_content_bytes, filename_for_logging="disco
                             normalized_line = normalize_text_general(line_text)
                             parsed = parse_discont_transaction_line(normalized_line)
                             if parsed:
-                                # Avoid adding duplicate entries for the same date and balance
-                                if not transactions or (transactions[-1]['Date'] != parsed['Date'] or transactions[-1]['Balance'] != parsed['Balance']):
-                                     transactions.append(parsed)
-                                # else: logging.debug(f"Discount: Skipping duplicate date/balance entry for line: {normalized_line.strip()}")
+                                # FIX: Removed the conditional append logic. Append all valid balance points,
+                                # and let the final groupby handle taking the last balance for each date.
+                                transactions.append(parsed)
                             # else: logging.debug(f"Discount: Line did not match transaction pattern: {normalized_line.strip()}")
 
                 except Exception as e:
@@ -405,6 +412,7 @@ def extract_and_parse_discont_pdf(pdf_content_bytes, filename_for_logging="disco
     df['Balance'] = pd.to_numeric(df['Balance'], errors='coerce') # Ensure numeric
     df = df.dropna(subset=['Date', 'Balance']) # Remove rows with parsing errors
 
+    # FIX: The `groupby('Date')['Balance'].last().reset_index()` is correct for daily last balances.
     df = df.sort_values(by='Date').groupby('Date')['Balance'].last().reset_index()
     df = df.sort_values(by='Date').reset_index(drop=True) # Final sort
 
@@ -412,17 +420,17 @@ def extract_and_parse_discont_pdf(pdf_content_bytes, filename_for_logging="disco
     return df[['Date', 'Balance']]
 
 
-# --- CREDIT REPORT PARSER (Assume correct from previous version) ---
+# --- CREDIT REPORT PARSER ---
 COLUMN_HEADER_WORDS_CR = {
     "שם", "מקור", "מידע", "מדווח", "מזהה", "עסקה", "מספר", "עסקאות",
     "גובה", "מסגרת", "מסגרות", "סכום", "הלוואות", "מקורי", "יתרת", "חוב",
-    "יתרה", "שלא", "שולמה", "במועד", "פרטי", "עסקה", "בנק", "אוצר", # Added "בנק", "אוצר"
-    "סוג", "מטבע", "מניין", "ימים", "ריבית", "ממוצעת" # Add more potential headers
+    "יתרה", "שלא", "שולמה", "במועד", "פרטי", "עסקה", "בנק", "אוצר",
+    "סוג", "מטבע", "מניין", "ימים", "ריבית", "ממוצעת"
 }
 BANK_KEYWORDS_CR = {"בנק", "בע\"מ", "אגוד", "דיסקונט", "לאומי", "הפועלים", "מזרחי",
                  "טפחות", "הבינלאומי", "מרכנתיל", "אוצר", "החייל", "ירושלים",
                  "איגוד", "מימון", "ישיר", "כרטיסי", "אשראי", "מקס", "פיננסים",
-                 "כאל", "ישראכרט", "פועלים", "לאומי", "דיסקונט", "מזרחי", "טפחות", "בינלאומי", "מרכנתיל", "איגוד"} # Added variations
+                 "כאל", "ישראכרט", "פועלים", "לאומי", "דיסקונט", "מזרחי", "טפחות", "בינלאומי", "מרכנתיל", "איגוד"}
 
 def clean_credit_number(text):
     """Specific cleaner for credit report numbers, uses general."""
@@ -441,7 +449,7 @@ def process_entry_final_cr(entry_data, section, all_rows_list):
     bank_name_cleaned = re.sub(r'\s+בנק$', '', bank_name_cleaned, flags=re.IGNORECASE).strip()
     bank_name_final = bank_name_cleaned if bank_name_cleaned else bank_name_raw
 
-    is_likely_bank = any(kw in bank_name_final for kw in ["לאומי", "הפועלים", "דיסקונט", "מזרחי", "הבינלאומי", "מרכנתיל", "ירושלים", "איגוד", "טפחות", "אוצר"]) # Specific bank names
+    is_likely_bank = any(kw in bank_name_final for kw in ["לאומי", "הפועלים", "דיסקונט", "מזרחי", "הבינלאומי", "מרכנתיל", "ירושלים", "איגוד", "טפחות", "אוצר"])
     if is_likely_bank and not bank_name_final.lower().endswith("בע\"מ"):
         bank_name_final += " בע\"מ"
     elif any(kw in bank_name_final for kw in ["מקס איט פיננסים", "מימון ישיר"]) and not bank_name_final.lower().endswith("בע\"מ"):
@@ -461,45 +469,31 @@ def process_entry_final_cr(entry_data, section, all_rows_list):
         val4 = numbers[3] if num_count > 3 else np.nan
 
         if section in ["עו\"ש", "מסגרת אשראי"]:
-             # Expected: Limit, Outstanding, Unpaid (optional)
-             # Could be 2 numbers (Limit, Outstanding) or 3 (Limit, Outstanding, Unpaid)
              if num_count >= 2:
                   limit_col = val1
                   outstanding_col = val2
                   unpaid_col = val3 if num_count > 2 else 0.0
-             elif num_count == 1: # If only one number, what is it? Assume Outstanding might be listed alone sometimes? Less likely.
-                  # This might indicate malformed entry or a section with only one number field.
-                  # Assuming the most common case is at least Limit+Outstanding (2 numbers).
-                  # Log and skip or try best guess? Let's skip if less than 2 for these sections for safety.
+             elif num_count == 1:
                   logging.debug(f"CR: Skipping עו\"ש/מסגרת entry for '{bank_name_final}' with only 1 number.")
                   return
 
-
         elif section in ["הלוואה", "משכנתה"]:
-            # Expected: Num Payments (optional), Original, Outstanding, Unpaid (optional)
-            # Could be 2 numbers (Original, Outstanding), 3 (Original, Outstanding, Unpaid OR Num Payments, Original, Outstanding), or 4.
             if num_count >= 2:
-                 # Check if the first number looks like a payment count (small integer)
-                 if pd.notna(val1) and val1 == int(val1) and val1 > 0 and val1 < 600 and num_count >= 3: # Heuristic: payments > 0 and < 600 (50 years)
-                      # Assuming Num Payments, Original, Outstanding, Unpaid
-                      original_col = val2 if num_count > 1 else np.nan
-                      outstanding_col = val3 if num_count > 2 else np.nan
+                 if pd.notna(val1) and val1 == int(val1) and val1 > 0 and val1 < 600 and num_count >= 3:
+                      original_col = val2
+                      outstanding_col = val3
                       unpaid_col = val4 if num_count > 3 else 0.0
                  else:
-                     # Assuming Original, Outstanding, Unpaid (if 3+ numbers) or Original, Outstanding (if 2 numbers)
                      original_col = val1
                      outstanding_col = val2 if num_count > 1 else np.nan
                      unpaid_col = val3 if num_count > 2 else 0.0
             elif num_count == 1:
-                 # If only one number, assume it's the outstanding balance? Less common, but possible.
-                 # Let's assume it's the outstanding balance if that's all we get.
                  outstanding_col = val1
-                 original_col = np.nan # Original is unknown
-                 unpaid_col = 0.0 # Assume 0 unpaid if not listed
+                 original_col = np.nan
+                 unpaid_col = 0.0
                  logging.debug(f"CR: Processing הלוואה/משכנתה entry for '{bank_name_final}' with only 1 number as Outstanding.")
 
         else: # Default case (e.g., "אחר" section) or fallback
-            # Try to interpret the numbers based on quantity, assuming common loan-like structure
             if num_count >= 2:
                  original_col = val1
                  outstanding_col = val2
@@ -508,12 +502,8 @@ def process_entry_final_cr(entry_data, section, all_rows_list):
                  outstanding_col = val1
                  original_col = np.nan
                  unpaid_col = 0.0
-            # If num_count is 0, it was caught at the beginning of the function.
-            # Limit is not applicable here (np.nan)
             logging.debug(f"CR: Processing 'אחר' entry for '{bank_name_final}' with {num_count} numbers.")
 
-
-        # Append the processed row if at least outstanding or limit is not NaN
         if pd.notna(outstanding_col) or pd.notna(limit_col):
              all_rows_list.append({
                  "סוג עסקה": section,
@@ -545,7 +535,8 @@ def extract_credit_data_final_v13(pdf_content_bytes, filename_for_logging="credi
                 "מסגרת אשראי מתחדשת": "מסגרת אשראי",
                 "אחר": "אחר" # Catch-all
             }
-            number_line_pattern = re.compile(r"^\s*.*?(-?\d{1,3}(?:,\d{3})*\.?\d*)\s*.*?$") # Relaxed number pattern
+            # FIX: Use the stricter number line pattern from the "working" version
+            number_line_pattern = re.compile(r"^\s*(-?\d{1,3}(?:,\d{3})*\.?\d*)\s*$")
             id_line_pattern = re.compile(r"^XX-[\w\d\-]+.*$")
 
             logging.info(f"Starting Credit Report PDF parsing for {filename_for_logging}")
@@ -582,81 +573,76 @@ def extract_credit_data_final_v13(pdf_content_bytes, filename_for_logging="credi
                             logging.debug(f"CR: Detected summary/footer line: {line}")
                             continue
 
-                        if current_section:
-                            number_match = number_line_pattern.match(line)
-                            if number_match:
-                                if current_entry:
-                                    try:
-                                        number_str = number_match.group(1)
-                                        number = clean_credit_number(number_str)
-                                        if number is not None:
-                                            num_list = current_entry.get('numbers', [])
-                                            if last_line_was_id:
-                                                if current_entry and not current_entry.get('processed', False):
-                                                     process_entry_final_cr(current_entry, current_section, extracted_rows)
-                                                current_entry = {'bank': current_entry['bank'], 'numbers': [number], 'processed': False}
-                                                logging.debug(f"CR: Detected number after ID line, starting new entry for bank '{current_entry['bank']}' with first number: {number}")
-                                            else:
-                                                 if len(num_list) < 5:
-                                                     current_entry['numbers'].append(number)
-                                                     logging.debug(f"CR: Added number {number} to current entry for bank '{current_entry.get('bank', 'N/A')}'. Numbers: {current_entry['numbers']}")
-                                                 else:
-                                                     logging.debug(f"CR: Skipping extra number {number} for bank '{current_entry.get('bank', 'N/A')}'. Max numbers reached.")
+                        # FIX: Reordered and simplified line classification logic
+                        number_match = number_line_pattern.match(line)
+                        is_id_line = id_line_pattern.match(line)
+                        is_noise_line = any(word in line.split() for word in COLUMN_HEADER_WORDS_CR) or line in [':', '.', '-', '—'] or (len(line.replace(' ','')) < 3 and not line.replace(' ','').isdigit()) or re.match(r"^\d{1,2}/\d{1,2}/\d{2,4}$", line)
 
-                                    except Exception as e: # Catch potential errors during cleaning/appending
-                                        logging.error(f"CR: Error processing number line '{line.strip()}': {e}", exc_info=True)
+                        if number_match:
+                            if current_entry:
+                                try:
+                                    number_str = number_match.group(1)
+                                    number = clean_credit_number(number_str)
+                                    if number is not None:
+                                        num_list = current_entry.get('numbers', [])
+                                        if last_line_was_id:
+                                            if current_entry and not current_entry.get('processed', False):
+                                                 process_entry_final_cr(current_entry, current_section, extracted_rows)
+                                            current_entry = {'bank': current_entry['bank'], 'numbers': [number], 'processed': False}
+                                            logging.debug(f"CR: Detected number after ID line, starting new entry for bank '{current_entry['bank']}' with first number: {number}")
+                                        else:
+                                             if len(num_list) < 5: # Limit numbers for an entry
+                                                 current_entry['numbers'].append(number)
+                                                 logging.debug(f"CR: Added number {number} to current entry for bank '{current_entry.get('bank', 'N/A')}'. Numbers: {current_entry['numbers']}")
+                                             else:
+                                                 logging.debug(f"CR: Skipping extra number {number} for bank '{current_entry.get('bank', 'N/A')}'. Max numbers reached.")
 
-                                last_line_was_id = False
-                                potential_bank_continuation_candidate = False
-                                continue
+                                except Exception as e: # Catch potential errors during cleaning/appending
+                                    logging.error(f"CR: Error processing number line '{line.strip()}': {e}", exc_info=True)
 
-                            is_id_line = id_line_pattern.match(line)
-                            if is_id_line:
-                                last_line_was_id = True
-                                potential_bank_continuation_candidate = False
-                                logging.debug(f"CR: Detected ID line: {line}")
-                                continue
+                            last_line_was_id = False
+                            potential_bank_continuation_candidate = False
+                            continue # Processed this line as a number
 
-                            is_noise_line = any(word in line.split() for word in COLUMN_HEADER_WORDS_CR) or line in [':', '.', '-', '—'] or (len(line.replace(' ','')) < 3 and not line.replace(' ','').isdigit()) or re.match(r"^\d{1,2}/\d{1,2}/\d{2,4}$", line) # Add date-only lines as noise
-                            if is_noise_line:
-                                last_line_was_id = False
-                                potential_bank_continuation_candidate = False
-                                logging.debug(f"CR: Skipping likely noise line: {line}")
-                                continue
+                        elif is_id_line:
+                            last_line_was_id = True
+                            potential_bank_continuation_candidate = False
+                            logging.debug(f"CR: Detected ID line: {line}")
+                            continue # Processed this line as an ID
 
-                            # If not a special line, treat as potential bank name or description
-                            contains_number = any(char.isdigit() for char in line.replace(',', '').replace('.', '')) # Check for digits
-                            contains_date_format = re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", line)
-                            is_non_bank_phrase = any(phrase in line for phrase in ["סך הכל", "סהכ", "סה״כ", "ריכוז נתונים", "הודעה זו כוללת"]) # Add more phrases
+                        elif is_noise_line:
+                            last_line_was_id = False
+                            potential_bank_continuation_candidate = False
+                            logging.debug(f"CR: Skipping likely noise line: {line}")
+                            continue # Processed this line as noise
 
-                            if not contains_number and not contains_date_format and not is_non_bank_phrase:
-                                 cleaned_line = re.sub(r'\s*XX-[\w\d\-]+.*|\s+\d+$', '', line).strip()
-                                 common_continuations = ["לישראל", "בע\"מ", "ומשכנתאות", "נדל\"ן", "דיסקונט", "הראשון", "פיננסים", "איגוד", "אשראי", "חברה", "למימון", "שירותים"]
-                                 seems_like_continuation_text = any(cleaned_line.startswith(cont) for cont in common_continuations) or (len(cleaned_line) > 3 and ' ' in cleaned_line)
+                        # If it's not a number, ID, or noise, it's potentially a bank name or description
+                        else:
+                            # FIX: Simplified conditions for bank name/continuation logic
+                            cleaned_line = re.sub(r'\s*XX-[\w\d\-]+.*|\s+\d+$', '', line).strip()
+                            common_continuations = ["לישראל", "בע\"מ", "ומשכנתאות", "נדל\"ן", "דיסקונט", "הראשון", "פיננסים", "איגוד", "אשראי", "חברה", "למימון", "שירותים"]
+                            
+                            # Check if it *seems* like a continuation based on content, not just if candidate is True
+                            seems_like_continuation_text = any(cleaned_line.startswith(cont) for cont in common_continuations) or \
+                                                           (len(cleaned_line) > 3 and ' ' in cleaned_line and not any(char.isdigit() for char in cleaned_line)) # Added check for no digits to ensure it's not a number line
 
-                                 if potential_bank_continuation_candidate and current_entry and seems_like_continuation_text:
-                                     current_entry['bank'] = (current_entry['bank'] + " " + cleaned_line).replace(" בע\"מ בע\"מ", " בע\"מ").strip()
-                                     logging.debug(f"CR: Appended continuation '{cleaned_line}' to bank name. New bank name: '{current_entry['bank']}'")
-                                     potential_bank_continuation_candidate = True # Still potentially continuing
-                                 elif len(cleaned_line) > 3 and any(kw in cleaned_line for kw in BANK_KEYWORDS_CR):
-                                      if current_entry and not current_entry.get('processed', False):
-                                           process_entry_final_cr(current_entry, current_section, extracted_rows)
-                                      current_entry = {'bank': cleaned_line, 'numbers': [], 'processed': False}
-                                      potential_bank_continuation_candidate = True
-                                      logging.debug(f"CR: Started new entry with bank name: '{cleaned_line}'")
-                                 else: # Neither continuation nor new bank start
-                                      if current_entry and current_entry.get('numbers') and not current_entry.get('processed', False):
-                                          process_entry_final_cr(current_entry, current_section, extracted_rows)
-                                          current_entry['processed'] = True
-                                      potential_bank_continuation_candidate = False
-
-                                 last_line_was_id = False
-                            else: # Contains numbers/dates or is a known non-bank phrase
+                            if potential_bank_continuation_candidate and current_entry and seems_like_continuation_text:
+                                current_entry['bank'] = (current_entry['bank'] + " " + cleaned_line).replace(" בע\"מ בע\"מ", " בע\"מ").strip()
+                                logging.debug(f"CR: Appended continuation '{cleaned_line}' to bank name. New bank name: '{current_entry['bank']}'")
+                                potential_bank_continuation_candidate = True # Still potentially continuing
+                            elif len(cleaned_line) > 3 and any(kw in cleaned_line for kw in BANK_KEYWORDS_CR) and not any(char.isdigit() for char in cleaned_line): # Ensure it's not a number line trying to be a bank
+                                 if current_entry and not current_entry.get('processed', False):
+                                      process_entry_final_cr(current_entry, current_section, extracted_rows)
+                                 current_entry = {'bank': cleaned_line, 'numbers': [], 'processed': False}
+                                 potential_bank_continuation_candidate = True
+                                 logging.debug(f"CR: Started new entry with bank name: '{cleaned_line}'")
+                            else: # Neither continuation nor new bank start, or invalid line for bank
                                   if current_entry and current_entry.get('numbers') and not current_entry.get('processed', False):
                                        process_entry_final_cr(current_entry, current_section, extracted_rows)
-                                       current_entry['processed'] = True
-                                  last_line_was_id = False
+                                       current_entry['processed'] = True # Mark as processed to avoid re-processing same entry
                                   potential_bank_continuation_candidate = False
+                            
+                            last_line_was_id = False # Reset ID flag after non-ID line
 
                 except Exception as e:
                     logging.error(f"CR: Error processing line {line_num+1} on page {page_num+1}: {e}", exc_info=True)
@@ -786,6 +772,12 @@ elif st.session_state.app_stage == "file_upload":
              st.info(f"הקובץ {uploaded_bank_file.name} הועלה בהצלחה. לחץ על 'עבד קבצים' לעיבוד.")
         elif not uploaded_bank_file:
              st.session_state.uploaded_bank_file_name = None
+        else: # File was previously uploaded and state matches
+            if not st.session_state.df_bank_uploaded.empty:
+                st.info(f"הקובץ {st.session_state.uploaded_bank_file_name} כבר הועלה ועובד. תוכל/י להעלות קובץ חדש או להמשיך.")
+            else:
+                st.info(f"הקובץ {st.session_state.uploaded_bank_file_name} הועלה אך טרם עובד. לחץ על 'עבד קבצים' לעיבוד.")
+
 
     uploaded_credit_file = st.file_uploader("העלה דוח נתוני אשראי (קובץ PDF) (מומלץ)", type="pdf", key="credit_pdf_uploader_main")
     if uploaded_credit_file and st.session_state.get('uploaded_credit_file_name') != uploaded_credit_file.name:
@@ -795,6 +787,11 @@ elif st.session_state.app_stage == "file_upload":
          st.info(f"הקובץ {uploaded_credit_file.name} הועלה בהצלחה. לחץ על 'עבד קבצים' לעיבוד.")
     elif not uploaded_credit_file:
          st.session_state.uploaded_credit_file_name = None
+    else: # File was previously uploaded and state matches
+        if not st.session_state.df_credit_uploaded.empty:
+            st.info(f"הקובץ {st.session_state.uploaded_credit_file_name} כבר הועלה ועובד. תוכל/י להעלות קובץ חדש או להמשיך.")
+        else:
+            st.info(f"הקובץ {st.session_state.uploaded_credit_file_name} הועלה אך טרם עובד. לחץ על 'עבד קבצים' לעיבוד.")
 
 
     if st.button("עבד קבצים והמשך לשאלון", key="process_files_button"):
@@ -805,8 +802,8 @@ elif st.session_state.app_stage == "file_upload":
 
         with st.spinner("מעבד קבצים..."):
             # Process Bank File
-            st.session_state.df_bank_uploaded = pd.DataFrame() # Reset before processing new file
-            if uploaded_bank_file is not None and st.session_state.bank_type_selected != "ללא דוח בנק":
+            # Only re-process if a new file was uploaded, or if the stored DF is empty for the current file
+            if uploaded_bank_file is not None and st.session_state.bank_type_selected != "ללא דוח בנק" and (st.session_state.df_bank_uploaded.empty or st.session_state.uploaded_bank_file_name != uploaded_bank_file.name):
                 try:
                     bank_file_bytes = uploaded_bank_file.getvalue()
                     parser_func = None
@@ -816,6 +813,7 @@ elif st.session_state.app_stage == "file_upload":
 
                     if parser_func:
                         st.session_state.df_bank_uploaded = parser_func(bank_file_bytes, uploaded_bank_file.name)
+                        st.session_state.uploaded_bank_file_name = uploaded_bank_file.name # Ensure name is updated
 
                     if st.session_state.df_bank_uploaded.empty:
                         st.warning(f"לא הצלחנו לחלץ נתונים מדוח הבנק ({st.session_state.bank_type_selected}). אנא וודא/י שהקובץ תקין והפורמט נתמך.")
@@ -827,15 +825,20 @@ elif st.session_state.app_stage == "file_upload":
                     logging.error(f"Error processing bank file {uploaded_bank_file.name}: {e}", exc_info=True)
                     st.error(f"אירעה שגיאה בעת עיבוד דוח הבנק: {e}")
                     error_processing = True
+            elif uploaded_bank_file is None or st.session_state.bank_type_selected == "ללא דוח בנק":
+                st.session_state.df_bank_uploaded = pd.DataFrame() # Clear bank data if no file/type selected
+                st.session_state.uploaded_bank_file_name = None
+            else:
+                 st.info("דוח בנק כבר עובד, לא נדרש עיבוד מחדש.")
 
 
             # Process Credit File
-            st.session_state.df_credit_uploaded = pd.DataFrame() # Reset before processing new file
-            st.session_state.total_debt_from_credit_report = None # Reset
-            if uploaded_credit_file is not None:
+            # Only re-process if a new file was uploaded, or if the stored DF is empty for the current file
+            if uploaded_credit_file is not None and (st.session_state.df_credit_uploaded.empty or st.session_state.uploaded_credit_file_name != uploaded_credit_file.name):
                 try:
                     credit_file_bytes = uploaded_credit_file.getvalue()
                     st.session_state.df_credit_uploaded = extract_credit_data_final_v13(credit_file_bytes, uploaded_credit_file.name)
+                    st.session_state.uploaded_credit_file_name = uploaded_credit_file.name # Ensure name is updated
                     if st.session_state.df_credit_uploaded.empty:
                         st.warning("לא הצלחנו לחלץ נתונים מדוח האשראי. אנא וודא/י שהקובץ תקין.")
                         error_processing = True
@@ -853,6 +856,12 @@ elif st.session_state.app_stage == "file_upload":
                     logging.error(f"Error processing credit file {uploaded_credit_file.name}: {e}", exc_info=True)
                     st.error(f"אירעה שגיאה בעת עיבוד דוח נתוני האשראי: {e}")
                     error_processing = True
+            elif uploaded_credit_file is None:
+                st.session_state.df_credit_uploaded = pd.DataFrame() # Clear credit data if no file
+                st.session_state.total_debt_from_credit_report = None
+                st.session_state.uploaded_credit_file_name = None
+            else:
+                 st.info("דוח אשראי כבר עובד, לא נדרש עיבוד מחדש.")
 
         # Move to questionnaire regardless of processing outcome
         if error_processing:
@@ -893,7 +902,9 @@ elif st.session_state.app_stage == "questionnaire":
         st.session_state.answers['q2_other_funding'] = st.text_area("2. האם יש מקורות מימון אחרים שבדקת?", value=st.session_state.answers.get('q2_other_funding', ''), key="q_s0_q2")
 
         existing_loans_bool_key = 'q3_existing_loans_bool_radio'
-        default_loan_bool_index = ("לא","כן").index(st.session_state.answers.get(existing_loans_bool_key, 'לא'))
+        # Ensure default value for radio matches options, and index is valid
+        default_loan_bool_value = st.session_state.answers.get(existing_loans_bool_key, 'לא')
+        default_loan_bool_index = ("כן", "לא").index(default_loan_bool_value) if default_loan_bool_value in ("כן", "לא") else 1 # Default to "לא" if not set or invalid
         st.session_state.answers[existing_loans_bool_key] = st.radio(
             "3. האם קיימות הלוואות נוספות (לא משכנתא)?",
             ("כן", "לא"),
@@ -908,7 +919,9 @@ elif st.session_state.app_stage == "questionnaire":
         else: st.session_state.answers['q3_loan_repayment_amount'] = 0.0
 
         balanced_bool_key = 'q4_financially_balanced_bool_radio'
-        default_balanced_index = ("כן","בערך","לא").index(st.session_state.answers.get(balanced_bool_key, 'כן'))
+        # Ensure default value for radio matches options, and index is valid
+        default_balanced_value = st.session_state.answers.get(balanced_bool_key, 'כן')
+        default_balanced_index = ("כן", "בערך", "לא").index(default_balanced_value) if default_balanced_value in ("כן", "בערך", "לא") else 0 # Default to "כן"
         st.session_state.answers[balanced_bool_key] = st.radio(
             "4. האם אתם מאוזנים כלכלית כרגע (הכנסות מכסות הוצאות)?",
             ("כן", "בערך", "לא"),
@@ -983,7 +996,9 @@ elif st.session_state.app_stage == "questionnaire":
         )
 
         arrears_key = 'arrears_collection_proceedings_radio'
-        default_arrears_index = ("לא","כן").index(st.session_state.answers.get(arrears_key, 'לא'))
+        # Ensure default value for radio matches options, and index is valid
+        default_arrears_value = st.session_state.answers.get(arrears_key, 'לא')
+        default_arrears_index = ("כן", "לא").index(default_arrears_value) if default_arrears_value in ("כן", "לא") else 1 # Default to "לא"
         st.session_state.answers[arrears_key] = st.radio(
             "האם קיימים פיגורים משמעותיים בתשלומים או הליכי גבייה פעילים נגדך?",
             ("כן", "לא"),
@@ -1070,20 +1085,17 @@ elif st.session_state.app_stage == "questionnaire":
         else:
             total_debt = float(st.session_state.answers.get('total_debt_amount', 0.0))
             fifty_percent_debt = total_debt * 0.5 if total_debt > 0 else 0.0
-            st.session_state.answers['can_raise_50_percent_radio'] = st.radio(
+            can_raise_50_percent_key = 'can_raise_50_percent_radio'
+            default_raise_index = ("לא","כן").index(st.session_state.answers.get(can_raise_50_percent_key, 'לא')) # Default to "לא"
+            st.session_state.answers[can_raise_50_percent_key] = st.radio(
                 f"האם תוכל/י לגייס סכום השווה לכ-50% מסך החובות הלא מגובים במשכנתא ({fifty_percent_debt:,.0f} ₪) ממקורות תמיכה (משפחה, חברים, מימוש נכסים) תוך זמן סביר (עד מספר חודשים)?",
                 ("כן", "לא"),
-                index=("לא","כן").index(st.session_state.answers.get('can_raise_50_percent_radio', 'לא')),
+                index=default_raise_index,
                 key="q_s100_q_raise_funds"
             )
             if st.button("המשך לסיכום", key="q_s100_to_summary_yellow_check"):
-                if st.session_state.answers.get('can_raise_50_percent_radio', 'לא') == "כן":
-                    st.session_state.classification_details.update({'classification': "צהוב", 'description': st.session_state.classification_details.get('description','') + " אין הליכי גבייה ויש יכולת לגייס 50% מהחוב ממקורות תמיכה.", 'color': "orange"})
-                else:
-                    st.session_state.classification_details.update({'classification': "צהוב+", 'description': st.session_state.classification_details.get('description','') + " אין הליכי גבייה אך אין יכולת מיידית לגייס סכום משמעותי ממקורות תמיכה.", 'color': "orange"}) # Maybe make this "צהוב+" or keep red? Let's use orange for now but add nuance. Or maybe it *is* red without ability to raise funds? Revert to Red if no ability to raise funds seems more appropriate for actionability.
-
                 # Re-evaluating classification for yellow based on ability to raise funds (simplified)
-                if st.session_state.answers.get('can_raise_50_percent_radio', 'לא') == "כן":
+                if st.session_state.answers.get(can_raise_50_percent_key, 'לא') == "כן":
                      st.session_state.classification_details.update({'classification': "צהוב", 'description': "סך החוב בגובה ההכנסה של 1-2 שנים, אין הליכי גבייה ויש יכולת לגייס 50% מהחוב ממקורות תמיכה.", 'color': "orange"})
                 else:
                      st.session_state.classification_details.update({'classification': "אדום", 'description': "סך החוב בגובה ההכנסה של 1-2 שנים, אין הליכי גבייה אך **אין** יכולת לגייס 50% מהחוב ממקורות תמיכה.", 'color': "red"}) # Leaning towards red if significant external help isn't possible for a yellow case
@@ -1102,7 +1114,7 @@ elif st.session_state.app_stage == "summary":
 
     # Retrieve calculated metrics
     total_net_income_ans = float(st.session_state.answers.get('total_net_income', 0.0))
-    total_fixed_expenses_ans = float(st.session_state.answers.get('expense_rent_mortgage', 0.0)) + float(st.session_state.answers.get('expense_debt_repayments', 0.0)) + float(st.session_state.answers.get('expense_alimony_other', 0.0))
+    total_fixed_expenses_ans = sum(float(st.session_state.answers.get(k,0.0)) for k in ['expense_rent_mortgage','expense_debt_repayments','expense_alimony_other'])
     monthly_balance_ans = total_net_income_ans - total_fixed_expenses_ans
     total_debt_amount_ans = float(st.session_state.answers.get('total_debt_amount', 0.0))
     annual_income_ans = total_net_income_ans * 12
@@ -1181,6 +1193,13 @@ elif st.session_state.app_stage == "summary":
             st.plotly_chart(fig_debt_pie, use_container_width=True)
         else:
              st.info("אין נתוני חוב משמעותיים בדוח האשראי להצגה.")
+    
+    # FIX: Added handling for when credit report was uploaded but has no debt data to display
+    elif st.session_state.uploaded_credit_file_name:
+         st.info(f"דוח נתוני האשראי הועלה ({st.session_state.uploaded_credit_file_name}) אך לא נמצאו בו נתוני חוב להצגה.")
+    else:
+         st.info("לא הועלה דוח נתוני אשראי לצורך פירוט חובות.")
+
 
     # Visualization 2: Debt vs. Income (Bar Chart)
     if total_debt_amount_ans > 0 or annual_income_ans > 0 :
@@ -1219,8 +1238,8 @@ elif st.session_state.app_stage == "summary":
             st.plotly_chart(fig_balance_trend, use_container_width=True)
         else:
              st.info(f"אין נתוני יתרות תקינים בדוח הבנק ({st.session_state.bank_type_selected}) להצגה.")
-    elif st.session_state.bank_type_selected != "ללא דוח בנק":
-        st.info(f"לא הועלה או לא הצלחנו לעבד דוח בנק מסוג {st.session_state.bank_type_selected}.")
+    elif st.session_state.bank_type_selected != "ללא דוח בנק" and st.session_state.uploaded_bank_file_name:
+        st.info(f"דוח בנק מסוג {st.session_state.bank_type_selected} הועלה ({st.session_state.uploaded_bank_file_name}) אך לא הצלחנו לעבד ממנו נתונים.")
     else:
          st.info("לא נבחר סוג דוח בנק או לא הועלה קובץ.")
 
