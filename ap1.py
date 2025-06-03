@@ -90,7 +90,6 @@ def extract_transactions_from_pdf_hapoalim(pdf_content_bytes, filename_for_loggi
         return pd.DataFrame()
 
     date_pattern_end = re.compile(r"(\d{1,2}/\d{1,2}/\d{4})\s*$")
-    # FIX: Use the more robust pattern from the "working" version
     balance_pattern_start = re.compile(r"^\s*(₪?-?[\d,]+\.\d{2})")
 
     logging.info(f"Starting Hapoalim PDF parsing for {filename_for_logging}")
@@ -154,8 +153,7 @@ def clean_transaction_amount_leumi(text):
     if text is None or pd.isna(text) or text == '': return None
     text = str(text).strip().replace('₪', '').replace(',', '')
     text = text.lstrip('\u200b')
-    # FIX: Add multi-decimal handling from working version
-    if text.count('.') > 1:
+    if text.count('.') > 1: # Handle cases like "1,234.56.78"
         parts = text.split('.')
         text = parts[0] + '.' + "".join(parts[1:])
     if '.' not in text: return None # Requires a decimal point
@@ -174,8 +172,7 @@ def clean_number_leumi(text):
      if text is None or pd.isna(text) or text == '': return None
      text = str(text).strip().replace('₪', '').replace(',', '')
      text = text.lstrip('\u200b')
-     # FIX: Add multi-decimal handling from working version
-     if text.count('.') > 1:
+     if text.count('.') > 1: # Handle cases like "1,234.56.78"
         parts = text.split('.')
         text = parts[0] + '.' + "".join(parts[1:])
      try:
@@ -192,7 +189,6 @@ def normalize_text_leumi(text):
     if text is None or pd.isna(text): return None
     text = str(text).replace('\r', ' ').replace('\n', ' ').replace('\u200b', '').strip()
     text = unicodedata.normalize('NFC', text)
-    # This Hebrew reversal logic is for specific PDF extraction cases. Keep as is.
     if any('\u0590' <= char <= '\u05EA' for char in text):
        words = text.split()
        reversed_text = ' '.join(words[::-1])
@@ -206,30 +202,33 @@ def parse_leumi_transaction_line_extracted_order_v2(line_text, previous_balance)
     pattern = re.compile(
         r"^([\-\u200b\d,\.]+)\s+" # 1: Balance
         r"(\d{1,3}(?:,\d{3})*\.\d{2})?\s*" # 2: Optional Amount
-        r"(\S+)\s+"             # 3: Reference (non-optional as in working version)
+        r"(\S+)?\s*"             # 3: Reference (FIX: Reverted to optional based on user's "working" code)
         r"(.*?)\s+"              # 4: Description
-        # FIX: The order of date groups was the issue. Reverting to match working version's logic.
-        r"(\d{1,2}/\d{1,2}/\d{2,4})\s+" # 5: This should be TRANSACTION Date (for trends)
-        r"(\d{1,2}/\d{1,2}/\d{2,4})$"   # 6: This should be VALUE Date
+        r"(\d{1,2}/\d{1,2}/\d{2,4})\s+" # 5: First Date (e.g., Value Date in some PDFs)
+        r"(\d{1,2}/\d{1,2}/\d{2,4})$"   # 6: Second Date (e.g., Transaction Date in some PDFs)
     )
 
     match = pattern.match(line)
-    if not match: return None
+    if not match: 
+        logging.debug(f"Leumi parse_line: No regex match for line: {line.strip()}")
+        return None
 
     balance_str = match.group(1)
     amount_str = match.group(2)
     reference_str = match.group(3)
     description_raw = match.group(4)
-    transaction_date_str = match.group(5) # Use this for the date field
-    value_date_str = match.group(6) # Keep for debugging/completeness, but not used for main date field
-
-    # FIX: Use transaction_date_str (group 5) for parsing the date for the trend.
-    parsed_date = parse_date_leumi(transaction_date_str)
-
-    if not parsed_date: return None
+    # FIX: Use match.group(5) for the primary date as it seemed to be the relevant one in the "working" example.
+    date_to_parse_str = match.group(5)
+    
+    parsed_date = parse_date_leumi(date_to_parse_str)
+    if not parsed_date: 
+        logging.debug(f"Leumi parse_line: Failed to parse date '{date_to_parse_str}' from line: {line.strip()}")
+        return None
 
     current_balance = clean_number_leumi(balance_str)
-    if current_balance is None: return None
+    if current_balance is None: 
+        logging.debug(f"Leumi parse_line: Failed to clean balance '{balance_str}' from line: {line.strip()}")
+        return None
 
     amount = clean_transaction_amount_leumi(amount_str) # Can be None
 
@@ -239,9 +238,7 @@ def parse_leumi_transaction_line_extracted_order_v2(line_text, previous_balance)
         tolerance = 0.01
         if abs(balance_diff + amount) <= tolerance: debit = amount
         elif abs(balance_diff - amount) <= tolerance: credit = amount
-    elif amount is None: # If no explicit amount, it might just be a balance line, not a transaction.
-         pass # For balance trend, we still want the balance even if no specific transaction amount.
-
+    
     return {'Date': parsed_date, 'Balance': current_balance, 'Debit': debit, 'Credit': credit, 'Reference': reference_str, 'Description': normalize_text_leumi(description_raw)}
 
 
@@ -250,7 +247,7 @@ def extract_leumi_transactions_line_by_line(pdf_content_bytes, filename_for_logg
     transactions_data = []
     try:
         with pdfplumber.open(io.BytesIO(pdf_content_bytes)) as pdf:
-            previous_balance = None
+            previous_balance = None # Tracks the balance of the previously processed valid line
             logging.info(f"Starting Leumi PDF parsing for {filename_for_logging}")
 
             for page_num, page in enumerate(pdf.pages):
@@ -263,7 +260,9 @@ def extract_leumi_transactions_line_by_line(pdf_content_bytes, filename_for_logg
                         normalized_line = normalize_text_leumi(line_text.strip())
                         if not normalized_line or len(normalized_line) < 10: continue
 
-                        # Try to find initial balance. This usually appears at the top of the statement.
+                        # Try to find initial balance at the beginning of the statement.
+                        # This block ensures previous_balance is set from a 'previous balance' line if available.
+                        # This line is usually *not* a transaction itself, so we 'continue' after setting previous_balance.
                         if previous_balance is None:
                             initial_balance_match = re.search(r"(?:יתרה\s+קודמת|יתרת\s+סגירה\s+קודמת|יתרה\s+נכון\s+לתאריך)\s+([\-\u200b\d,\.]+)", normalized_line)
                             if initial_balance_match:
@@ -271,26 +270,27 @@ def extract_leumi_transactions_line_by_line(pdf_content_bytes, filename_for_logg
                                 initial_bal = clean_number_leumi(bal_str)
                                 if initial_bal is not None:
                                     previous_balance = initial_bal
-                                    # Don't add this "previous balance" line to transactions_data, it's just a starting point
                                     logging.debug(f"Leumi: Found initial balance on page {page_num+1}: {initial_bal} from line: {normalized_line.strip()}")
-                                    continue # Skip this line from further parsing for transactions
+                                    continue # Skip this line from further parsing for transactions_data
 
+                        # Attempt to parse as a transaction line, using the previous_balance for debit/credit calculation
                         parsed_data = parse_leumi_transaction_line_extracted_order_v2(normalized_line, previous_balance)
 
                         if parsed_data and parsed_data['Balance'] is not None and parsed_data['Date'] is not None:
                             current_balance = parsed_data['Balance']
                             parsed_date = parsed_data['Date']
 
-                            # Append any valid balance and date, and let the final groupby resolve
+                            # Append this data point to the list
                             transactions_data.append({'Date': parsed_date, 'Balance': current_balance})
                             logging.debug(f"Leumi: Appended balance - Date: {parsed_date}, Balance: {current_balance}, Line: {normalized_line.strip()}")
 
-                            # Always update previous_balance if a valid balance was parsed from the line
+                            # Crucially, update previous_balance with the current line's balance for the next line's potential debit/credit calculation
                             previous_balance = current_balance
                         else:
-                            # If a line doesn't match the transaction pattern or has invalid data,
-                            # previous_balance remains from last valid line.
-                            pass
+                            # If a line doesn't match the specific transaction pattern, or parsing fails,
+                            # it's skipped for transaction data, and previous_balance remains unchanged from the last valid line.
+                            logging.debug(f"Leumi: Line did not match transaction pattern or contained invalid data (skipped): {normalized_line.strip()}")
+                            pass 
 
                 except Exception as e:
                      logging.error(f"Leumi: Error processing line {line_num+1} on page {page_num+1}: {e}", exc_info=True)
@@ -309,8 +309,9 @@ def extract_leumi_transactions_line_by_line(pdf_content_bytes, filename_for_logg
     df['Balance'] = pd.to_numeric(df['Balance'], errors='coerce') # Ensure numeric
     df = df.dropna(subset=['Date', 'Balance']) # Remove rows where date or balance parsing failed
 
+    # Sort by date and take the last balance for each date. This is key for trend.
     df = df.sort_values(by='Date').groupby('Date')['Balance'].last().reset_index()
-    df = df.sort_values(by='Date').reset_index(drop=True) # Final sort
+    df = df.sort_values(by='Date').reset_index(drop=True) # Final sort for display/consistency
 
     logging.info(f"Leumi: Successfully extracted {len(df)} unique balance points from {filename_for_logging}")
     return df[['Date', 'Balance']]
@@ -437,7 +438,7 @@ def process_entry_final_cr(entry_data, section, all_rows_list):
 
     numbers_raw = entry_data['numbers']
     # Clean and filter out None values
-    numbers = [clean_credit_number(n) for n n in numbers_raw if clean_credit_number(n) is not None]
+    numbers = [clean_credit_number(n) for n in numbers_raw if clean_credit_number(n) is not None]
 
     num_count = len(numbers)
     limit_col, original_col, outstanding_col, unpaid_col = np.nan, np.nan, np.nan, np.nan
@@ -1174,7 +1175,6 @@ elif st.session_state.app_stage == "summary":
         else:
              st.info("אין נתוני חוב משמעותיים בדוח האשראי להצגה.")
     
-    # FIX: Added handling for when credit report was uploaded but has no debt data to display
     elif st.session_state.uploaded_credit_file_name:
          st.info(f"דוח נתוני האשראי הועלה ({st.session_state.uploaded_credit_file_name}) אך לא נמצאו בו נתוני חוב להצגה.")
     else:
