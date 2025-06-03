@@ -198,14 +198,18 @@ def normalize_text_leumi(text):
 def parse_leumi_transaction_line_extracted_order_v2(line_text, previous_balance):
     """Attempts to parse a line assuming a specific column order from text extraction."""
     line = line_text.strip()
-    if not line or len(line) < 15: return None
+    # Removed len(line) < 15 check based on user feedback (less strict)
+    if not line: return None
+    
+    # FIX: Changed Reference field to mandatory (\S+) based on user's successful script
+    # FIX: Date groups are `(date1) (date2)`. We will use date1 (group 5) for parsing.
     pattern = re.compile(
-        r"^([\-\u200b\d,\.]+)\s+" # 1: Balance
-        r"(\d{1,3}(?:,\d{3})*\.\d{2})?\s*" # 2: Optional Amount
-        r"(\S+)?\s*"             # 3: Reference (FIX: Reverted to optional based on user's "working" code)
-        r"(.*?)\s+"              # 4: Description
-        r"(\d{1,2}/\d{1,2}/\d{2,4})\s+" # 5: First Date (e.g., Value Date in some PDFs)
-        r"(\d{1,2}/\d{1,2}/\d{2,4})$"   # 6: Second Date (e.g., Transaction Date in some PDFs)
+        r"^([\-\u200b\d,\.]+)\s+"           # 1: Balance
+        r"(\d{1,3}(?:,\d{3})*\.\d{2})?\s*"  # 2: Optional Amount
+        r"(\S+)\s+"                         # 3: Reference (MANDATORY)
+        r"(.*?)\s+"                         # 4: Description
+        r"(\d{1,2}/\d{1,2}/\d{2,4})\s+"     # 5: First Date (e.g., Transaction Date)
+        r"(\d{1,2}/\d{1,2}/\d{2,4})$"       # 6: Second Date (e.g., Value Date)
     )
 
     match = pattern.match(line)
@@ -217,8 +221,8 @@ def parse_leumi_transaction_line_extracted_order_v2(line_text, previous_balance)
     amount_str = match.group(2)
     reference_str = match.group(3)
     description_raw = match.group(4)
-    # FIX: Use match.group(5) for the primary date as it seemed to be the relevant one in the "working" example.
-    date_to_parse_str = match.group(5)
+    # FIX: Use match.group(5) for the primary date as it matched user's working script logic
+    date_to_parse_str = match.group(5) 
     
     parsed_date = parse_date_leumi(date_to_parse_str)
     if not parsed_date: 
@@ -248,6 +252,7 @@ def extract_leumi_transactions_line_by_line(pdf_content_bytes, filename_for_logg
     try:
         with pdfplumber.open(io.BytesIO(pdf_content_bytes)) as pdf:
             previous_balance = None # Tracks the balance of the previously processed valid line
+            first_transaction_processed = False # Flag to set the first previous_balance correctly
             logging.info(f"Starting Leumi PDF parsing for {filename_for_logging}")
 
             for page_num, page in enumerate(pdf.pages):
@@ -258,34 +263,34 @@ def extract_leumi_transactions_line_by_line(pdf_content_bytes, filename_for_logg
                     lines = text.splitlines()
                     for line_num, line_text in enumerate(lines):
                         normalized_line = normalize_text_leumi(line_text.strip())
-                        if not normalized_line or len(normalized_line) < 10: continue
+                        # FIX: Replaced len(normalized_line) < 10 with just empty check
+                        if not normalized_line: continue
 
-                        # Try to find initial balance at the beginning of the statement.
-                        # This block ensures previous_balance is set from a 'previous balance' line if available.
-                        # This line is usually *not* a transaction itself, so we 'continue' after setting previous_balance.
-                        if previous_balance is None:
-                            initial_balance_match = re.search(r"(?:יתרה\s+קודמת|יתרת\s+סגירה\s+קודמת|יתרה\s+נכון\s+לתאריך)\s+([\-\u200b\d,\.]+)", normalized_line)
-                            if initial_balance_match:
-                                bal_str = initial_balance_match.group(1)
-                                initial_bal = clean_number_leumi(bal_str)
-                                if initial_bal is not None:
-                                    previous_balance = initial_bal
-                                    logging.debug(f"Leumi: Found initial balance on page {page_num+1}: {initial_bal} from line: {normalized_line.strip()}")
-                                    continue # Skip this line from further parsing for transactions_data
-
-                        # Attempt to parse as a transaction line, using the previous_balance for debit/credit calculation
+                        # FIX: Removed the explicit 'initial_balance_match' block with 'continue'.
+                        # The 'previous_balance' will now be set by the first successfully parsed line.
+                        
                         parsed_data = parse_leumi_transaction_line_extracted_order_v2(normalized_line, previous_balance)
 
                         if parsed_data and parsed_data['Balance'] is not None and parsed_data['Date'] is not None:
                             current_balance = parsed_data['Balance']
                             parsed_date = parsed_data['Date']
 
-                            # Append this data point to the list
-                            transactions_data.append({'Date': parsed_date, 'Balance': current_balance})
-                            logging.debug(f"Leumi: Appended balance - Date: {parsed_date}, Balance: {current_balance}, Line: {normalized_line.strip()}")
+                            # FIX: Set first_transaction_processed and previous_balance if this is the first valid line
+                            if not first_transaction_processed:
+                                previous_balance = current_balance
+                                first_transaction_processed = True
 
-                            # Crucially, update previous_balance with the current line's balance for the next line's potential debit/credit calculation
-                            previous_balance = current_balance
+                            # FIX: Only append to transactions_data if it's an actual debit/credit transaction
+                            if parsed_data['Debit'] is not None or parsed_data['Credit'] is not None:
+                                transactions_data.append({'Date': parsed_date, 'Balance': current_balance})
+                                logging.debug(f"Leumi: Appended transaction - Date: {parsed_date}, Balance: {current_balance}, Line: {normalized_line.strip()}")
+                                # Update previous_balance only if it's an actual transaction
+                                previous_balance = current_balance
+                            else:
+                                # If it's a valid line (matches pattern) but no debit/credit, still update previous_balance
+                                # This ensures continuity of balance for the next transaction line
+                                logging.debug(f"Leumi: Parsed line with balance but no Debit/Credit calculated, updating previous_balance: {normalized_line.strip()}")
+                                previous_balance = current_balance
                         else:
                             # If a line doesn't match the specific transaction pattern, or parsing fails,
                             # it's skipped for transaction data, and previous_balance remains unchanged from the last valid line.
@@ -309,9 +314,8 @@ def extract_leumi_transactions_line_by_line(pdf_content_bytes, filename_for_logg
     df['Balance'] = pd.to_numeric(df['Balance'], errors='coerce') # Ensure numeric
     df = df.dropna(subset=['Date', 'Balance']) # Remove rows where date or balance parsing failed
 
-    # Sort by date and take the last balance for each date. This is key for trend.
     df = df.sort_values(by='Date').groupby('Date')['Balance'].last().reset_index()
-    df = df.sort_values(by='Date').reset_index(drop=True) # Final sort for display/consistency
+    df = df.sort_values(by='Date').reset_index(drop=True) # Final sort
 
     logging.info(f"Leumi: Successfully extracted {len(df)} unique balance points from {filename_for_logging}")
     return df[['Date', 'Balance']]
@@ -516,7 +520,6 @@ def extract_credit_data_final_v13(pdf_content_bytes, filename_for_logging="credi
                 "מסגרת אשראי מתחדשת": "מסגרת אשראי",
                 "אחר": "אחר" # Catch-all
             }
-            # Use the stricter number line pattern from the "working" version
             number_line_pattern = re.compile(r"^\s*(-?\d{1,3}(?:,\d{3})*\.?\d*)\s*$")
             id_line_pattern = re.compile(r"^XX-[\w\d\-]+.*$")
 
@@ -554,7 +557,6 @@ def extract_credit_data_final_v13(pdf_content_bytes, filename_for_logging="credi
                             logging.debug(f"CR: Detected summary/footer line: {line}")
                             continue
 
-                        # Reordered and simplified line classification logic
                         number_match = number_line_pattern.match(line)
                         is_id_line = id_line_pattern.match(line)
                         is_noise_line = any(word in line.split() for word in COLUMN_HEADER_WORDS_CR) or line in [':', '.', '-', '—'] or (len(line.replace(' ','')) < 3 and not line.replace(' ','').isdigit()) or re.match(r"^\d{1,2}/\d{1,2}/\d{2,4}$", line)
@@ -599,11 +601,9 @@ def extract_credit_data_final_v13(pdf_content_bytes, filename_for_logging="credi
 
                         # If it's not a number, ID, or noise, it's potentially a bank name or description
                         else:
-                            # Simplified conditions for bank name/continuation logic
                             cleaned_line = re.sub(r'\s*XX-[\w\d\-]+.*|\s+\d+$', '', line).strip()
                             common_continuations = ["לישראל", "בע\"מ", "ומשכנתאות", "נדל\"ן", "דיסקונט", "הראשון", "פיננסים", "איגוד", "אשראי", "חברה", "למימון", "שירותים"]
                             
-                            # Check if it *seems* like a continuation based on content, not just if candidate is True
                             seems_like_continuation_text = any(cleaned_line.startswith(cont) for cont in common_continuations) or \
                                                            (len(cleaned_line) > 3 and ' ' in cleaned_line and not any(char.isdigit() for char in cleaned_line)) # Added check for no digits to ensure it's not a number line
 
