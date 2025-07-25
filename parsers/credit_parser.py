@@ -1,16 +1,16 @@
 """
-פרסר עבור דוחות נתוני אשראי
+פרסר דוח נתוני אשראי
 """
-import re
 import pandas as pd
-import numpy as np
 import pymupdf as fitz
+import re
 import logging
-from utils.text_processing import clean_number
+import numpy as np
+from utils.helpers import clean_number, normalize_text
 
 
-class CreditReportParser:
-    """פרסר עבור דוחות נתוני אשראי"""
+class CreditParser:
+    """פרסר דוח נתוני אשראי"""
     
     def __init__(self):
         self.logger = logging.getLogger("credit_parser")
@@ -27,12 +27,12 @@ class CreditReportParser:
             "מסגרת אשראי מתחדשת": "מסגרת אשראי"
         }
     
-    def parse_pdf(self, pdf_content_bytes, filename="credit_report_pdf"):
+    def parse_pdf(self, pdf_bytes, filename="credit_report.pdf"):
         """פרסור PDF של דוח נתוני אשראי"""
         extracted_rows = []
         
         try:
-            with fitz.open(stream=pdf_content_bytes, filetype="pdf") as doc:
+            with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
                 current_section = None
                 current_entry = None
                 
@@ -40,8 +40,8 @@ class CreditReportParser:
                     text = page.get_text("text")
                     lines = text.splitlines()
                     
-                    for line_text in lines:
-                        line = line_text.strip()
+                    for line in lines:
+                        line = normalize_text(line.strip())
                         if not line:
                             continue
                         
@@ -63,7 +63,7 @@ class CreditReportParser:
                     self._process_entry(current_entry, current_section, extracted_rows)
                     
         except Exception as e:
-            self.logger.error(f"Failed to process credit report {filename}: {e}")
+            self.logger.error(f"Error processing credit report: {e}")
             return pd.DataFrame()
         
         return self._create_dataframe(extracted_rows)

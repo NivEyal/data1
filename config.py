@@ -1,13 +1,13 @@
 """
-קובץ הגדרות עבור האפליקציה
+הגדרות האפליקציה
 """
 
-# הגדרות OpenAI
-OPENAI_MODEL = "gpt-3.5-turbo"
+# הגדרות בסיסיות
+APP_TITLE = "יועץ פיננסי חכם"
+APP_ICON = "💰"
 
-# הגדרות UI
-PAGE_TITLE = "מומחה כלכלת המשפחה GPT"
-PAGE_ICON = "💰"
+# הגדרות OpenAI
+OPENAI_MODEL = "gpt-4o-mini"
 
 # הגדרות בנקים נתמכים
 SUPPORTED_BANKS = {
@@ -17,10 +17,10 @@ SUPPORTED_BANKS = {
 }
 
 # הגדרות סיווג פיננסי
-CLASSIFICATION_THRESHOLDS = {
+THRESHOLDS = {
     "GREEN_MAX": 1.0,
     "YELLOW_MAX": 2.0
 }
 
 # הגדרות ברירת מחדל
-DEFAULT_MONTHLY_INCOME = 15000
+DEFAULT_INCOME = 15000
