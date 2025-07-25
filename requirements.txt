@@ -1,7 +1,7 @@
 streamlit
- pandas
- plotly 
-pymupdf 
-pdfplumber 
-openai 
+pandas
+plotly
+pymupdf
+pdfplumber
+openai
 numpy
